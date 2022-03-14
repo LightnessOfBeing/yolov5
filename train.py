@@ -31,6 +31,8 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm import tqdm
+from omegaconf import DictConfig
+import hydra
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -83,11 +85,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
 
     # Save run settings
-    if not evolve:
-        with open(save_dir / 'hyp.yaml', 'w') as f:
-            yaml.safe_dump(hyp, f, sort_keys=False)
-        with open(save_dir / 'opt.yaml', 'w') as f:
-            yaml.safe_dump(vars(opt), f, sort_keys=False)
+    # if not evolve:
+    #     with open(save_dir / 'hyp.yaml', 'w') as f:
+    #         yaml.safe_dump(hyp, f, sort_keys=False)
+    #     with open(save_dir / 'opt.yaml', 'w') as f:
+    #         yaml.safe_dump(vars(opt), f, sort_keys=False)
 
     # Loggers
     data_dict = None
@@ -131,12 +133,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
 
     # Freeze
-    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
-    for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
-        if any(x in k for x in freeze):
-            LOGGER.info(f'freezing {k}')
-            v.requires_grad = False
+    # freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+    # for k, v in model.named_parameters():
+    #     v.requires_grad = True  # train all layers
+    #     if any(x in k for x in freeze):
+    #         LOGGER.info(f'freezing {k}')
+    #         v.requires_grad = False
 
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
@@ -495,10 +497,11 @@ def parse_opt(known=False):
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 
-
-def main(opt, callbacks=Callbacks()):
+@hydra.main(config_path="configs", config_name="config.yaml")
+def main(opt: DictConfig, callbacks=Callbacks()):
     # Checks
     if RANK in [-1, 0]:
+        #print_args(FILE.stem, opt)
         print_args(FILE.stem, opt)
         check_git_status()
         check_requirements(exclude=['thop'])
@@ -639,5 +642,6 @@ def run(**kwargs):
 
 
 if __name__ == "__main__":
-    opt = parse_opt()
-    main(opt)
+    #opt = parse_opt()
+    #main(opt)
+    main()
