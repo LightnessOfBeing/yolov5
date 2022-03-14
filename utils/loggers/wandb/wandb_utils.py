@@ -167,7 +167,8 @@ class WandbLogger():
                                         name=name,
                                         job_type=job_type,
                                         id=run_id,
-                                        allow_val_change=True) if not wandb.run else wandb.run
+                                        allow_val_change=True,
+                                        mode="disabled" if opt.debug else "online") if not wandb.run else wandb.run
         if self.wandb_run:
             if self.job_type == 'Training':
                 if opt.upload_dataset:

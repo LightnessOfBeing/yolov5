@@ -37,3 +37,4 @@ upload_dataset: false
 bbox_interval: -1
 artifact_alias: latest
 run_name: "baseline"
+debug: false
