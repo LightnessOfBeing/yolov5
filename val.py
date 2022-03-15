@@ -29,6 +29,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from utils import metrics
+
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -78,7 +80,14 @@ def process_batch(detections, labels, iouv):
         correct (Array[N, 10]), for 10 IoU levels
     """
     correct = torch.zeros(detections.shape[0], iouv.shape[0], dtype=torch.bool, device=iouv.device)
-    iou = box_iou(labels[:, 1:], detections[:, :4])
+    iou = box_iou(labels[:, 1:], detections[:, :4])  # [num_gt x num_preds] (all_gt vs all_preds)
+    iou_scores = torch.zeros(len(detections), dtype=torch.float32, device='cpu')
+    # for each gt get a matching pred_box with maximum IoU
+    best_ious, best_boxes_indices = torch.max(iou, dim=1)
+    iou_scores[best_boxes_indices] = best_ious.cpu()
+    # for rest of pred boxes -> IoU = 0
+    
+
     x = torch.where((iou >= iouv[0]) & (labels[:, 0:1] == detections[:, 5]))  # IoU above threshold and classes match
     if x[0].shape[0]:
         matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detection, iou]
@@ -89,7 +98,7 @@ def process_batch(detections, labels, iouv):
             matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
         matches = torch.Tensor(matches).to(iouv.device)
         correct[matches[:, 1].long()] = matches[:, 2:3] >= iouv
-    return correct
+    return correct, iou_scores
 
 
 @torch.no_grad()
@@ -157,6 +166,7 @@ def run(data,
         # Data
         data = check_dataset(data)  # check
 
+    class_names = data['names']
     # Configure
     model.eval()
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith('coco/val2017.txt')  # COCO dataset
@@ -180,7 +190,7 @@ def run(data,
     s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     dt, p, r, f1, mp, mr, map50, map = [0.0, 0.0, 0.0], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class = [], [], [], []
+    jdict, stats, ap, ap_class, iou_scores = [], [], [], [], []
     pbar = tqdm(dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         t1 = time_sync()
@@ -232,12 +242,13 @@ def run(data,
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
                 scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct = process_batch(predn, labelsn, iouv)
+                correct, ious = process_batch(predn, labelsn, iouv)
                 if plots:
                     confusion_matrix.process_batch(predn, labelsn)
             else:
                 correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))  # (correct, conf, pcls, tcls)
+            iou_scores.append(ious)
 
             # Save/log
             if save_txt:
@@ -254,15 +265,21 @@ def run(data,
             Thread(target=plot_images, args=(im, output_to_target(out), paths, f, names), daemon=True).start()
 
     # Compute metrics
-    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
+    # n = num_det
+    # m = num_gt_boxes
+    # k = num_batches
+    # stats: [k] -> [(is_correct: [n x num_iou_thresholds; bool], confidence: [n], predicted_class: [n], true_class: [m]), ...]
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy 
+    # stats: [4] -> (is_correct: [n * k x num_iou_thresholds; bool], confidence: [n * k], predicted_class: [n * k], true_class: [m * k])
     if len(stats) and stats[0].any():
+        # p, r, f1, ap - np.array((num_classes, ))
         tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+        mIoU = torch.mean(torch.cat(iou_scores))
         nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     else:
         nt = torch.zeros(1)
-
     # Print results
     pf = '%20s' + '%11i' * 2 + '%11.3g' * 4  # print format
     LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
@@ -317,7 +334,24 @@ def run(data,
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+        
+    metrics_dict = {
+        'metrics/precision': mp,
+        'metrics/recall': mp,
+        'metrics/mAP_0.5': map50,
+        'metrics/mAP_0.5:0.95': map,
+        'metrics/mIoU': mIoU,
+    }
+    
+    for i, name in enumerate(class_names):
+        metrics_dict[f'metrics/class_precision/{name}'] = p[i]
+        metrics_dict[f'metrics/class_recall/{name}'] = r[i]
+        metrics_dict[f'metrics/class_f1/{name}'] = f1[i]
+        metrics_dict[f'metrics/class_AP_0.5/{name}'] = ap50[i]
+        metrics_dict[f'metrics/class_AP_0.5:0.95/{name}'] = ap[i]
+    
+    metrics_dict['val/box_loss'], metrics_dict['val/obj_loss'], metrics_dict['val/cls_loss'] = (loss.cpu() / len(dataloader)).tolist()
+    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t, metrics_dict
 
 
 def parse_opt():
